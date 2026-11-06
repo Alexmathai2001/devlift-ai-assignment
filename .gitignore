@@ -25,3 +25,6 @@ target/
 
 # Terraform saved plans
 *tfplan*
+
+# Claude Code project context (local only)
+CLAUDE.md

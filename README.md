@@ -5,8 +5,8 @@ hosted on **Amazon ECS (Fargate)** behind an Application Load Balancer. All AWS
 infrastructure is defined with **Terraform**.
 
 - **Region:** `eu-north-1` (Stockholm)
-- **AWS account:** `390630837851`
-- **IAM user:** `alex_iam_user`
+- **AWS account:** `<ACCOUNT_ID>`
+- **IAM user:** `<IAM_USER>`
 
 > This README is a running log. Each step records what was done, why, and the
 > concepts involved. Steps marked ✅ are complete; ⏳ are planned.
@@ -58,9 +58,9 @@ whether a container is healthy and should keep receiving traffic.
 2. ✅ App: Spring Boot service with `GET /health`
 3. ✅ Dockerize: multi-stage Dockerfile, test locally
 4. ✅ Terraform layer 1: ECR repository, then build and push the image
-5. ⏳ Terraform layer 2: VPC, ALB, ECS cluster/service, IAM roles, log group
-6. ⏳ Deploy and verify with `curl http://<alb-dns>/health`
-7. ⏳ Teardown with `terraform destroy` (the ALB costs money while idle)
+5. ✅ Terraform layer 2: VPC, ALB, ECS cluster/service, IAM roles, log group
+6. ✅ Deploy and verify with `curl http://<alb-dns>/health`
+7. ⏸ Teardown with `terraform destroy` (the ALB costs money while idle). **On hold:** the stack stays running until explicitly told to tear it down.
 
 ### Design decisions
 
@@ -158,9 +158,9 @@ aws sts get-caller-identity
 
 ```json
 {
-    "UserId": "AIDAVV43JRZN3ZEL32MWG",
-    "Account": "390630837851",
-    "Arn": "arn:aws:iam::390630837851:user/alex_iam_user"
+    "UserId": "<USER_ID>",
+    "Account": "<ACCOUNT_ID>",
+    "Arn": "arn:aws:iam::<ACCOUNT_ID>:user/<IAM_USER>"
 }
 ```
 
@@ -306,8 +306,8 @@ Apply result: `2 added, 0 changed, 0 destroyed`. This also confirmed that the IA
 has permission to create ECR repositories.
 
 ```
-registry       = "390630837851.dkr.ecr.eu-north-1.amazonaws.com"
-repository_url = "390630837851.dkr.ecr.eu-north-1.amazonaws.com/health-api"
+registry       = "<ACCOUNT_ID>.dkr.ecr.eu-north-1.amazonaws.com"
+repository_url = "<ACCOUNT_ID>.dkr.ecr.eu-north-1.amazonaws.com/health-api"
 ```
 
 ### 4.3 Push the image
@@ -344,17 +344,127 @@ size:   ~93 MB (compressed)
 > stores *compressed* layers. A **digest** (`sha256:...`) identifies the exact image
 > content and is immutable, while a **tag** is just a label pointing at a digest.
 
-## Step 5: Terraform layer 2 (networking, ALB, ECS) ⏳
+## Step 5: Terraform layer 2 (networking, ALB, ECS) ✅
 
-_To be documented._
+All files are in `terraform/ecs/`. It is a separate Terraform root with its own state, so
+the registry (layer 1) survives a `destroy` of this layer.
 
-## Step 6: Deploy and verify ⏳
+| File | Resources |
+|---|---|
+| `main.tf` | Provider; `data` lookups for the ECR repo and Availability Zones |
+| `network.tf` | VPC `10.0.0.0/16`, internet gateway, 2 public subnets (2 AZs), route table `0.0.0.0/0 → IGW` |
+| `security.tf` | `alb-sg` (:80 from anywhere) and `task-sg` (:8080 **only from `alb-sg`**) |
+| `alb.tf` | ALB, target group (`ip` targets, health check `GET /health` expecting 200), HTTP :80 listener |
+| `iam.tf` | Task **execution** role plus `AmazonECSTaskExecutionRolePolicy` |
+| `ecs.tf` | CloudWatch log group (7-day retention), cluster, task definition, service |
+| `variables.tf` / `outputs.tf` | Image tag, port, sizing; ALB URL, image, log group |
 
-_To be documented._
+### Key concepts
 
-## Step 7: Teardown ⏳
+- **Public subnet:** a subnet is public only because its route table sends `0.0.0.0/0`
+  to an internet gateway. Two subnets in two AZs are required by the ALB.
+- **Security group chaining:** `task-sg` allows port 8080 *from the ALB's security group*
+  rather than from an IP range. The task has a public IP, but nothing except the ALB
+  can connect to it.
+- **Target group `ip` type:** Fargate tasks (`awsvpc` mode) each have their own network
+  interface and IP, and ECS registers them automatically.
+- **Task execution role vs. task role:** the execution role is for the ECS agent (pull from
+  ECR, write logs). A task role is for the app's own AWS calls. This app makes none, so
+  there is no task role (least privilege).
+- **Task definition:** immutable blueprint (image, 0.5 vCPU / 1 GB, port 8080, log
+  config). Changes create a new revision. **Service:** keeps 1 task running and
+  registered with the ALB.
+- **`health_check_grace_period_seconds = 60`:** ALB health failures are ignored while the
+  JVM starts, so ECS doesn't kill the task prematurely.
+- **`depends_on` the listener:** the target group must be attached to a listener before
+  the service registers with it.
 
-_To be documented._
+### Commands
+
+```bash
+cd terraform/ecs
+terraform init
+terraform validate
+terraform plan -out=tfplan      # Plan: 22 to add, 0 to change, 0 to destroy
+terraform apply tfplan          # Apply complete! Resources: 22 added
+```
+
+The ALB took about 2m47s to provision and everything else was quick. The IAM permissions
+(`CreateRole`, `AttachRolePolicy`, `PassRole`) turned out to be available to the user.
+
+### Design trade-offs (production would differ)
+
+| This project | Production |
+|---|---|
+| Public subnets, task has a public IP, no NAT (saves about $32/month) | Private subnets with NAT gateway or VPC endpoints |
+| HTTP :80 only | HTTPS :443 with an ACM certificate and a domain |
+| 1 task | 2+ tasks across AZs, with auto scaling |
+| Local Terraform state | S3 backend with locking |
+| `force_delete` on ECR | Off |
+
+## Step 6: Deploy and verify ✅
+
+Outputs after apply:
+
+```
+alb_url    = "http://<alb-dns-name>"
+health_url = "http://<alb-dns-name>/health"
+image      = "<ACCOUNT_ID>.dkr.ecr.eu-north-1.amazonaws.com/health-api:v1"
+log_group  = "/ecs/health-api"
+```
+
+Verification, polling the health URL every 10 seconds right after `apply`:
+
+```
+try 1: HTTP 000   # ALB DNS not resolving/ready yet
+try 2: HTTP 503   # ALB up, no healthy targets yet
+try 3: HTTP 503
+try 4: HTTP 502   # target registered, container still starting
+try 5: HTTP 200   {"status":"UP"}
+```
+
+This progression is normal. About 1-2 minutes passed between the apply finishing and the
+first 200.
+
+```bash
+curl http://<alb-dns>/health
+aws ecs describe-services --cluster health-api-cluster --services health-api-service
+aws elbv2 describe-target-health --target-group-arn <tg-arn>
+```
+
+Service state: `desired 1, running 1, ACTIVE`. Target `10.0.0.163` is `healthy`.
+
+### Debugging cheat sheet
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| 503 | No healthy targets (yet) | Target group → Targets tab |
+| 502 | Target registered but not answering | Container logs (`/ecs/health-api`) |
+| `CannotPullContainerError` | No route to ECR or missing execution role | ECS → service → Events / stopped task reason |
+| Task restarts in a loop | Health check failing or app crashing | CloudWatch logs, grace period |
+
+### Where to see it in the console (region: Europe (Stockholm) `eu-north-1`)
+
+ECR → Repositories → `health-api`; ECS → Clusters → `health-api-cluster`; EC2 → Load
+Balancers → `health-api-alb`; EC2 → Target Groups → `health-api-tg`; CloudWatch → Log
+groups → `/ecs/health-api`.
+
+> **Cost warning:** while this stack is running it costs roughly $0.08-0.10 per hour
+> (ALB, Fargate task, public IPv4 addresses). Run the teardown in step 7 when finished.
+
+## Step 7: Teardown ⏸ (on hold)
+
+Not performed yet. The stack is intentionally left running until requested. It costs
+roughly $0.08-0.10 per hour while up (estimate; check current AWS pricing).
+
+When it is time, **destroy `terraform/ecs` first, then `terraform/ecr`**. The ECS layer
+looks up the ECR repo with a `data` source, so destroying ECR first would break the ECS
+plan and destroy.
+
+```bash
+cd terraform/ecs && terraform destroy
+cd ../ecr        && terraform destroy     # optional: removes the repo and its images
+```
 
 ---
 
