@@ -22,3 +22,6 @@ target/
 .DS_Store
 .env
 *.pem
+
+# Terraform saved plans
+*tfplan*

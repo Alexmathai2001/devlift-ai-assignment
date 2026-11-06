@@ -57,7 +57,7 @@ whether a container is healthy and should keep receiving traffic.
 1. ✅ Tooling: install AWS CLI and Terraform, authenticate
 2. ✅ App: Spring Boot service with `GET /health`
 3. ✅ Dockerize: multi-stage Dockerfile, test locally
-4. ⏳ Terraform layer 1: ECR repository, then build and push the image
+4. ✅ Terraform layer 1: ECR repository, then build and push the image
 5. ⏳ Terraform layer 2: VPC, ALB, ECS cluster/service, IAM roles, log group
 6. ⏳ Deploy and verify with `curl http://<alb-dns>/health`
 7. ⏳ Teardown with `terraform destroy` (the ALB costs money while idle)
@@ -267,9 +267,82 @@ runs as `uid=100(app)`, not root.
 > (`X86_64`). Building on an ARM machine (e.g. Apple Silicon) would need
 > `--platform linux/amd64` or the task set to `ARM64`.
 
-## Step 4: Terraform layer 1 (ECR) and image push ⏳
+## Step 4: Terraform layer 1 (ECR) and image push ✅
 
-_To be documented._
+### 4.1 Terraform files (`terraform/ecr/`)
+
+| File | Contents |
+|---|---|
+| `main.tf` | `terraform` block (version ≥ 1.5, AWS provider `~> 6.0`), the `provider "aws"` block with `default_tags`, the ECR repository and a lifecycle policy |
+| `variables.tf` | `aws_region` (`eu-north-1`), `repo_name` (`health-api`), `max_images` (5) |
+| `outputs.tf` | `repository_url` and `registry` |
+
+ECR repository settings and why:
+
+| Setting | Value | Reason |
+|---|---|---|
+| `image_tag_mutability` | `IMMUTABLE` | A tag such as `v1` can never be overwritten, so deploys and rollbacks are reproducible. Every push needs a new tag. |
+| `scan_on_push` | `true` | Free basic CVE scan on each push |
+| encryption | `AES256` | Encrypted at rest |
+| lifecycle policy | keep newest 5 | Old images are expired automatically to limit storage cost |
+| `force_delete` | `true` | Lets `terraform destroy` delete a non-empty repo. Convenient for an assignment, not for production. |
+
+### 4.2 Terraform workflow
+
+```bash
+cd terraform/ecr
+terraform init                  # downloads AWS provider v6.72.0, writes .terraform.lock.hcl
+terraform validate
+terraform plan -out=tfplan      # dry run: Plan: 2 to add, 0 to change, 0 to destroy
+terraform apply tfplan          # applies exactly the reviewed plan
+```
+
+- `.terraform.lock.hcl` pins the provider version and **should be committed**.
+- `*tfplan*` is in `.gitignore`. Saved plans can contain sensitive values.
+- State is **local** (`terraform.tfstate`, git-ignored). Production would use an S3
+  backend with locking.
+
+Apply result: `2 added, 0 changed, 0 destroyed`. This also confirmed that the IAM user
+has permission to create ECR repositories.
+
+```
+registry       = "390630837851.dkr.ecr.eu-north-1.amazonaws.com"
+repository_url = "390630837851.dkr.ecr.eu-north-1.amazonaws.com/health-api"
+```
+
+### 4.3 Push the image
+
+```bash
+cd terraform/ecr
+REG=$(terraform output -raw registry)
+URL=$(terraform output -raw repository_url)
+
+aws ecr get-login-password | docker login --username AWS --password-stdin $REG
+docker tag health-api:local $URL:v1
+docker push $URL:v1
+```
+
+1. `get-login-password` swaps the IAM credentials for a Docker auth token, valid for
+   **12 hours**. `--password-stdin` keeps it out of shell history.
+2. `docker tag` adds a second name for the same image. The registry hostname in the
+   name tells Docker where to push.
+3. `docker push` uploads only the layers ECR doesn't already have.
+
+Verified in ECR:
+
+```bash
+aws ecr describe-images --repository-name health-api
+```
+
+```
+tag:    v1
+digest: sha256:f21eb9a7e2341e862584899a220a5eed331628f14a5147355a3a36c6f433e229
+size:   ~93 MB (compressed)
+```
+
+> **Concept:** the local image shows 229 MB and ECR shows ~93 MB because the registry
+> stores *compressed* layers. A **digest** (`sha256:...`) identifies the exact image
+> content and is immutable, while a **tag** is just a label pointing at a digest.
 
 ## Step 5: Terraform layer 2 (networking, ALB, ECS) ⏳
 
