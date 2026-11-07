@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECS ChatOps</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #66707c; --line: #dfe3e8;
+    --accent: #2457d6; --accent-text: #ffffff; --user: #e8eefc; --ok: #1a7f4b; --warn: #a15c00; --bad: #b3261e;
+    --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #181c22; --text: #e8eaed; --muted: #98a2ae; --line: #2a3038;
+      --accent: #6c97ff; --accent-text: #0b1020; --user: #1f2a44; --ok: #5fd08f; --warn: #f0b34a; --bad: #ff8a80;
+      --code: #20252c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px 20px; max-width: 1200px; margin: 0 auto; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #chat { display: flex; flex-direction: column; height: calc(100vh - 130px); min-height: 420px; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 85%; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.bot { align-self: flex-start; background: var(--code); }
+  .msg.error { color: var(--bad); }
+  form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+  input[type=text] { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; }
+  button { padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .plan { align-self: stretch; max-width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--panel); }
+  .plan h3 { margin: 0 0 8px; font-size: 14px; }
+  .res { margin: 8px 0; }
+  .res b { font-family: ui-monospace, monospace; font-size: 13px; }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  td { padding: 3px 6px; border-top: 1px solid var(--line); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  .from { color: var(--bad); } .to { color: var(--ok); }
+  .warn { color: var(--warn); font-size: 13px; margin: 6px 0 0; }
+  .actions { margin-top: 10px; display: flex; gap: 8px; }
+  aside { padding: 14px 16px; align-self: start; }
+  aside h2 { margin: 0 0 8px; font-size: 14px; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ECS ChatOps</h1>
+  <p>Describe a change to the running health-api service. Every change is planned and needs your approval before it is applied.</p>
+</header>
+<main>
+  <section class="card" id="chat">
+    <div id="log" aria-live="polite"></div>
+    <form id="form">
+      <input type="text" id="input" autocomplete="off" maxlength="2000" placeholder='e.g. "scale to 2 tasks" or "give it 1 vCPU and 2 GB"' aria-label="Instruction">
+      <button class="primary" id="send" type="submit">Send</button>
+    </form>
+  </section>
+  <aside class="card">
+    <h2>Live service <span id="health" class="pill">...</span></h2>
+    <dl id="cfg"></dl>
+    <p class="hint" id="note"></p>
+  </aside>
+</main>
+<script>
+const TOKEN = "__TOKEN__";
+const sid = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())).slice(0, 36);
+const log = document.getElementById("log"), input = document.getElementById("input"), send = document.getElementById("send");
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "Content-Type": "application/json", "X-Chatops-Token": TOKEN },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+function bubble(text, cls) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
+}
+function fmt(v) { return v === null || v === undefined ? "none" : typeof v === "object" ? JSON.stringify(v) : String(v); }
+
+function planCard(r) {
+  const card = document.createElement("div"); card.className = "plan";
+  const h = document.createElement("h3"); h.textContent = "Terraform plan (nothing has changed yet)"; card.appendChild(h);
+  for (const res of r.plan) {
+    const box = document.createElement("div"); box.className = "res";
+    const b = document.createElement("b"); b.textContent = res.address;
+    const t = document.createElement("span"); t.className = "tag"; t.textContent = res.actions.join(" + ");
+    box.append(b, t);
+    const table = document.createElement("table");
+    for (const c of res.changes) {
+      const tr = document.createElement("tr");
+      const a = document.createElement("td"); a.textContent = c.attribute;
+      const from = document.createElement("td"); from.className = "from"; from.textContent = fmt(c.before);
+      const to = document.createElement("td"); to.className = "to"; to.textContent = fmt(c.after);
+      tr.append(a, from, to); table.appendChild(tr);
+    }
+    box.appendChild(table); card.appendChild(box);
+  }
+  for (const w of r.warnings || []) { const p = document.createElement("p"); p.className = "warn"; p.textContent = "Note: " + w; card.appendChild(p); }
+  const actions = document.createElement("div"); actions.className = "actions";
+  const ok = document.createElement("button"); ok.className = "primary"; ok.textContent = "Apply";
+  const no = document.createElement("button"); no.textContent = "Cancel";
+  ok.onclick = async () => {
+    ok.disabled = no.disabled = true; ok.textContent = "Applying...";
+    try { const d = await api("/api/apply", { pending_id: r.pending_id }); card.remove(); bubble("Applied. " + d.message, "bot"); watch(); }
+    catch (e) { ok.textContent = "Apply"; no.disabled = false; ok.disabled = false; bubble(e.message, "bot error"); }
+  };
+  no.onclick = async () => { ok.disabled = no.disabled = true; try { await api("/api/cancel", {}); card.remove(); bubble("Cancelled. No changes made.", "bot"); } catch (e) { bubble(e.message, "bot error"); } };
+  actions.append(ok, no); card.appendChild(actions);
+  log.appendChild(card); log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById("form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = input.value.trim(); if (!text) return;
+  bubble(text, "user"); input.value = ""; send.disabled = true;
+  document.querySelectorAll(".plan").forEach(p => p.remove());  // a new message discards the old plan (server side too)
+  const wait = bubble("Working...", "bot");
+  try {
+    const r = await api("/api/chat", { session_id: sid, message: text });
+    wait.remove();
+    bubble(r.reply, "bot" + (r.kind === "error" || r.kind === "not_possible" ? " error" : ""));
+    if (r.kind === "plan") planCard(r);
+  } catch (e) { wait.remove(); bubble(e.message, "bot error"); }
+  send.disabled = false; input.focus();
+});
+
+async function refresh() {
+  try {
+    const s = await api("/api/state");
+    const c = s.config, st = s.status, dl = document.getElementById("cfg");
+    const rows = [["tasks (running/desired)", st.running + " / " + st.desired], ["rollout", st.rollout_state || "-"],
+      ["healthy targets", st.healthy_targets], ["CPU units", c.task_cpu], ["memory MiB", c.task_memory], ["image tag", c.image_tag],
+      ["log retention d", c.log_retention_days], ["grace period s", c.health_check_grace_period_seconds],
+      ["min/max healthy %", c.deployment_minimum_healthy_percent + " / " + c.deployment_maximum_percent],
+      ["env vars", Object.keys(c.environment).length]];
+    dl.replaceChildren();
+    for (const [k, v] of rows) { const dt = document.createElement("dt"), dd = document.createElement("dd"); dt.textContent = k; dd.textContent = v; dl.append(dt, dd); }
+    const h = document.getElementById("health");
+    const good = st.healthy_targets > 0 && st.running === st.desired && st.rollout_state === "COMPLETED";
+    h.textContent = good ? "healthy" : (st.desired === 0 ? "stopped" : "updating"); h.className = "pill " + (good ? "ok" : st.desired === 0 ? "bad" : "warn");
+    document.getElementById("note").textContent = "Updated " + new Date().toLocaleTimeString();
+  } catch (e) { document.getElementById("note").textContent = e.message; }
+}
+let timer; function watch() { refresh(); clearInterval(timer); timer = setInterval(refresh, 5000); }
+bubble("Hi. Tell me what to change on the health-api ECS service, for example \"scale to 2 tasks\". I'll show a Terraform plan and wait for you to approve it.", "bot");
+watch();
+</script>
+</body>
+</html>

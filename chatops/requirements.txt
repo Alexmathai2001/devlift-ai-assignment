@@ -1,0 +1,6 @@
+fastapi~=0.162
+uvicorn[standard]~=0.54
+openai~=3.46
+boto3[crt]~=1.43
+pytest~=9.2
+httpx~=0.28
