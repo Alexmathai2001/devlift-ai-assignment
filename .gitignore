@@ -28,3 +28,9 @@ target/
 
 # Claude Code project context (local only)
 CLAUDE.md
+
+# ChatOps app: local env, audit log, caches, Terraform overrides written by the chat
+.venv/
+__pycache__/
+.pytest_cache/
+chatops/audit.log

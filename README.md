@@ -1,12 +1,8 @@
-# Health API on AWS ECS (Fargate) with Terraform
+# Health API on AWS ECS 
 
 A small health-check API, packaged as a Docker image, pushed to **Amazon ECR**, and
-hosted on **Amazon ECS (Fargate)** behind an Application Load Balancer. All AWS
+hosted on **Amazon ECS** behind an Application Load Balancer. All AWS
 infrastructure is defined with **Terraform**.
-
-- **Region:** `eu-north-1` (Stockholm)
-- **AWS account:** `<ACCOUNT_ID>`
-- **IAM user:** `<IAM_USER>`
 
 > This README is a running log. Each step records what was done, why, and the
 > concepts involved. Steps marked ✅ are complete; ⏳ are planned.
@@ -60,11 +56,11 @@ whether a container is healthy and should keep receiving traffic.
 4. ✅ Terraform layer 1: ECR repository, then build and push the image
 5. ✅ Terraform layer 2: VPC, ALB, ECS cluster/service, IAM roles, log group
 6. ✅ Deploy and verify with `curl http://<alb-dns>/health`
-7. ⏸ Teardown with `terraform destroy` (the ALB costs money while idle). **On hold:** the stack stays running until explicitly told to tear it down.
+7. ✅ ChatOps: a local chat UI that turns plain-English instructions into reviewed Terraform changes (see [Step 7](#step-8-chatops-chat-to-terraform-))
 
 ### Design decisions
 
-- **Public subnets, no NAT gateway.** Tasks get public IPs. This avoids about
+- **Public subnets.** Tasks get public IPs. This avoids about
   $32/month for a NAT gateway and is fine for an assignment. The production pattern
   is private subnets plus NAT or VPC endpoints.
 - **Two-layer Terraform.** ECR is created first, the image is pushed, and only then is
@@ -465,6 +461,118 @@ plan and destroy.
 cd terraform/ecs && terraform destroy
 cd ../ecr        && terraform destroy     # optional: removes the repo and its images
 ```
+
+---
+
+## Step 8: ChatOps, chat to Terraform ✅
+
+A local web chat (`chatops/`, Python FastAPI) where you type an instruction such as
+*"scale to 2 tasks"* or *"give it 1 vCPU and 2 GB"*, and the running ECS service is changed
+through Terraform, **only after you approve a plan**.
+
+```
+instruction ─▶ 1 COMPILE  OpenAI (function calling) fills in Terraform variables, e.g. {desired_count: 2}
+            ─▶ 2 VALIDATE guardrails.py: allowed variables, ranges, Fargate CPU/memory pairs
+            ─▶ 3 WRITE    terraform/ecs/chatops.auto.tfvars.json
+            ─▶ 4 PLAN     terraform plan -out, shown in the chat as a before -> after table
+            ─▶ 5 APPROVE  you click Apply (nothing has changed before this)
+            ─▶ 6 APPLY    terraform apply of that exact saved plan
+            ─▶ 7 VERIFY   live status panel (read-only boto3): running/desired, healthy targets
+```
+
+**The model never writes HCL or calls AWS.** It only proposes values for a fixed list of
+existing Terraform variables. Terraform stays the source of truth and is the only thing that
+changes AWS. boto3 is read-only (current state, ECR tags, status).
+
+### What the chat may change
+
+| Setting (Terraform variable) | Limits |
+|---|---|
+| `desired_count` | 0-4 (0 stops the app; the UI warns) |
+| `task_cpu` / `task_memory` | Valid Fargate pairs only, capped at 2 vCPU |
+| `image_tag` | Must already exist in ECR |
+| `log_retention_days` | A value CloudWatch accepts |
+| `health_check_grace_period_seconds` | 0-600 |
+| `deployment_minimum_healthy_percent` / `deployment_maximum_percent` | 0-100 / 100-200 |
+| `environment` (add or remove variables) | Valid names; names that look like secrets are refused |
+
+Four of these (grace period, the two deployment percentages, `environment`) were added to
+`terraform/ecs` for this step, defaulting to the current values. `terraform plan` still reported
+**No changes** afterwards. Anything else (ports, VPC, ALB, IAM, region, deleting resources) is
+refused.
+
+### Staying in scope: off-topic and impossible requests
+
+The model is **not allowed to chat**. It must call exactly one of five functions
+(`tool_choice="required"`), and every reply you see is built in code from fixed templates
+(`app/replies.py`), never from model-written text.
+
+| You ask | Function chosen | What you get |
+|---|---|---|
+| "scale to 2 tasks" | `propose_changes` | Validation, then a Terraform plan and an Apply/Cancel card |
+| "what is the CPU set to?" | `show_config` | The values, rendered from live AWS data |
+| "add a second load balancer", "change the port", "delete the VPC" | `not_possible` | `That isn't possible: <fixed reason>` plus the list of what can be changed |
+| "scale to 50 tasks", "256 CPU with 8 GB" | `propose_changes`, then rejected by `validate()` | `That isn't possible:` with the exact limit that was broken |
+| "make it bigger" | `ask_clarification` | One short question, no plan |
+| "write me a poem", "hi", "what's the capital of France?", "ignore your rules" | `out_of_context` | One fixed message: *"That's outside what I can help with. I only handle configuration changes to the health-api ECS service..."* |
+
+If the model returns no recognised function call at all, the reply is the same out-of-context
+message, so a misbehaving model cannot make the chat talk about something else.
+
+### Safety layers
+
+1. **Forced function calling + `validate()`**: the model can only classify and fill in values,
+   and every value it returns is re-checked in code. Model output is never trusted as-is.
+2. **Plan allow-list**: a plan that touches anything other than the ECS service, task
+   definition or log group is blocked and never offered for approval. Only the task definition
+   may be replaced; nothing else may be deleted.
+3. **Human approval**: Apply runs the *exact saved plan* that was shown. Terraform rejects it if
+   state changed in between. A new message discards an unapplied plan.
+4. **Local only**: binds to `127.0.0.1`, checks the `Host` header, and requires a per-run token
+   (embedded in the served page) so another website cannot drive it.
+5. **Audit log**: every instruction, proposal, plan and apply goes to `chatops/audit.log`
+   (git-ignored).
+
+### Run it
+
+```bash
+cd chatops
+./.venv/bin/pip install -r requirements.txt            # first time (the venv already exists here)
+export OPENAI_API_KEY=...                              # in your own terminal, never in git or chat
+export OPENAI_MODEL=...                                # optional; default gpt-4.1; must support function calling
+aws login                                              # if your AWS session expired
+./.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+# open http://127.0.0.1:8000
+./.venv/bin/python -m pytest -q                        # 71 tests, no network or API key needed
+```
+
+### Verified
+
+- 71 unit/API tests pass (guardrails, plan safety, approval flow, scope enforcement, fixed reply
+  templates, OpenAI response parsing and error mapping with a fake client, host/token checks).
+  The scope tests mock the model's *choice* of function, so they prove the code handles each
+  choice correctly, not that the real model always picks the right one.
+- Against the real account (**read-only, nothing applied**): live config and status read
+  correctly, and real `terraform plan`s for scaling, CPU/memory and an environment variable were
+  produced, summarized and discarded. Afterwards Terraform reported no drift.
+- A real request to OpenAI with a deliberately invalid key returned the expected clean
+  "authentication failed" message, so the SDK, network path and error handling work.
+- **Not yet verified:** how accurately the real model classifies prompts (needs a valid key; try
+  an off-topic one, an impossible one and a normal change, and tell me any it gets wrong), a
+  successful model call with a valid key (none was available), that the
+  default model name is available to your key, and a real approved apply through the UI. Test
+  with a harmless change first, such as `log_retention_days`.
+
+### Caveats
+
+- `chatops.auto.tfvars.json` is how the chat's changes persist. It is **not** git-ignored, so
+  changes show up in `git diff`; commit it, or the next plain `terraform apply` from a fresh
+  checkout reverts to the defaults. Do not put secrets in `environment`.
+- Provider: OpenAI (Chat Completions with function calling). The default model `gpt-4.1` could
+  not be confirmed against current OpenAI docs; if your key can't use it you get a clear error
+  naming `OPENAI_MODEL`. Content-filter and truncated replies are shown as errors.
+- Changing CPU, memory, image or environment creates a new task definition and a rolling
+  redeploy, so expect a minute or two before the status panel shows healthy.
 
 ---
 
