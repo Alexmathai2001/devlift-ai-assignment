@@ -22,7 +22,7 @@ resource "aws_ecs_task_definition" "app" {
     cpu_architecture        = "X86_64" # matches how the image was built
   }
 
-  container_definitions = jsonencode([{
+  container_definitions = jsonencode([merge({
     name      = var.name
     image     = local.image
     essential = true
@@ -40,7 +40,12 @@ resource "aws_ecs_task_definition" "app" {
         "awslogs-stream-prefix" = "app"
       }
     }
-  }])
+    },
+    # Only emitted when set, so an empty map leaves the task definition unchanged
+    length(var.environment) > 0 ? {
+      environment = [for k, v in var.environment : { name = k, value = v }]
+    } : {}
+  )])
 }
 
 # Keeps `desired_count` tasks running and registered with the ALB
@@ -52,7 +57,9 @@ resource "aws_ecs_service" "app" {
   launch_type     = "FARGATE"
 
   # Ignore ALB health failures while the JVM is still starting
-  health_check_grace_period_seconds = 60
+  health_check_grace_period_seconds  = var.health_check_grace_period_seconds
+  deployment_minimum_healthy_percent = var.deployment_minimum_healthy_percent
+  deployment_maximum_percent         = var.deployment_maximum_percent
 
   network_configuration {
     subnets          = aws_subnet.public[*].id

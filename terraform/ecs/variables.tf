@@ -51,3 +51,27 @@ variable "log_retention_days" {
   type        = number
   default     = 7
 }
+
+variable "health_check_grace_period_seconds" {
+  description = "Seconds ECS ignores failing ALB health checks after a task starts"
+  type        = number
+  default     = 60
+}
+
+variable "deployment_minimum_healthy_percent" {
+  description = "Lower limit (% of desired_count) of healthy tasks during a deployment"
+  type        = number
+  default     = 100
+}
+
+variable "deployment_maximum_percent" {
+  description = "Upper limit (% of desired_count) of running tasks during a deployment"
+  type        = number
+  default     = 200
+}
+
+variable "environment" {
+  description = "Environment variables for the container (do not put secrets here)"
+  type        = map(string)
+  default     = {}
+}
